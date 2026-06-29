@@ -1,0 +1,17 @@
+# Ignore the virtual environment
+venv/
+env/
+.venv/
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# CRUCIAL: Ignore your API keys and config folder!
+config/api_keys.json
+config/
+memory.json
+
+# Ignore OS system files
+.DS_Store
+Thumbs.db
