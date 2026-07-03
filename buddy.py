@@ -57,6 +57,7 @@ from actions.reminder          import reminder
 from actions.computer_settings import computer_settings
 from actions.screen_processor  import screen_process
 from actions.youtube_video     import youtube_video
+from actions.music_player      import music_player_action
 from actions.desktop           import desktop_control
 from actions.browser_control   import browser_control
 from actions.file_controller   import file_controller
@@ -2052,6 +2053,18 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "music_player",
+        "description": "Plays music from YouTube, YouTube Music, or Spotify by opening the matching search result in the browser.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING", "description": "Song, artist, album, or playlist to play"},
+                "service": {"type": "STRING", "description": "youtube | youtubemusic | spotify (default: youtube)"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
         "name": "screen_process",
         "description": (
             "Captures and analyzes the screen or webcam image. "
@@ -2501,6 +2514,10 @@ class BuddyLive:
 
             elif name == "youtube_video":
                 r = await loop.run_in_executor(None, lambda: youtube_video(parameters=args, response=None, player=self.ui))
+                result = r or "Done."
+
+            elif name == "music_player":
+                r = await loop.run_in_executor(None, lambda: music_player_action(parameters=args, response=None, player=self.ui))
                 result = r or "Done."
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
