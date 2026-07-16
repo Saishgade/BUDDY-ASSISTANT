@@ -1,0 +1,483 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import json
+import os
+import platform
+import random
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+try:
+    import qrcode
+except Exception:  # pragma: no cover
+    qrcode = None
+
+
+# ---------------------------------------------------------------------------
+# Shared, process-wide state.
+#
+# buddy.py reloads this file as a *fresh* module every few seconds (for the
+# HUD status panel) while also keeping one original copy loaded for actual
+# tool calls. Plain module-level globals would therefore get silently reset
+# on every HUD refresh, and the tool-call copy would never see them anyway.
+# Stashing state on `sys` sidesteps this: `sys` is the one truly global
+# singleton that every reload of this file shares, no matter how many times
+# or from how many places it gets re-imported.
+# ---------------------------------------------------------------------------
+
+def _shared_state() -> Dict[str, Any]:
+    if not hasattr(sys, "_buddy_mobile_state"):
+        sys._buddy_mobile_state = {
+            "server": None,
+            "queue": [],
+            "queue_lock": threading.Lock(),
+            "server_lock": threading.Lock(),
+        }
+    return sys._buddy_mobile_state
+
+
+def _enqueue_command(action: str, target: str, value: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    state = _shared_state()
+    command = {
+        "id": base64.urlsafe_b64encode(os.urandom(6)).decode("ascii").rstrip("="),
+        "action": action,
+        "target": target,
+        "value": value,
+        "metadata": metadata or {},
+        "created_at": time.time(),
+    }
+    with state["queue_lock"]:
+        state["queue"].append(command)
+    return command
+
+
+def _pop_next_command() -> Optional[Dict[str, Any]]:
+    state = _shared_state()
+    with state["queue_lock"]:
+        if state["queue"]:
+            return state["queue"].pop(0)
+    return None
+
+
+def _is_connected() -> bool:
+    return os.environ.get("BUDDY_MOBILE_CONNECTED", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class LocalPairingServer:
+    """LAN pairing + command-polling endpoint for the paired phone."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 8765) -> None:
+        self.host = host
+        self.port = port
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._httpd: Optional[ThreadingHTTPServer] = None
+
+    def is_running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def _json_response(self, handler: BaseHTTPRequestHandler, status: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def _make_handler(self):
+        server_ref = self
+
+        class PairingRequestHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+
+                if parsed.path == "/pair":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    code = (query.get("code", [""])[0] or "").strip()
+                    token = (query.get("token", [""])[0] or "").strip()
+                    expected_code = os.environ.get("BUDDY_MOBILE_PAIR_CODE", "")
+                    expected_token = os.environ.get("BUDDY_MOBILE_PAIR_TOKEN", "")
+                    if code and code == expected_code and (not token or token == expected_token):
+                        os.environ["BUDDY_MOBILE_CONNECTED"] = "1"
+                        server_ref._json_response(self, HTTPStatus.OK, {
+                            "ok": True,
+                            "local_only": True,
+                            "message": "Pairing accepted.",
+                        })
+                        return
+                    server_ref._json_response(self, HTTPStatus.BAD_REQUEST, {
+                        "ok": False,
+                        "message": "Invalid or expired pairing code.",
+                    })
+                    return
+
+                if parsed.path == "/connect":
+                    server_ref._json_response(self, HTTPStatus.OK, {
+                        "ok": True,
+                        "message": "Mobile companion is listening.",
+                    })
+                    return
+
+                if parsed.path == "/commands/next":
+                    if not _is_connected():
+                        server_ref._json_response(self, HTTPStatus.UNAUTHORIZED, {
+                            "ok": False,
+                            "message": "Not paired yet.",
+                        })
+                        return
+                    command = _pop_next_command()
+                    server_ref._json_response(self, HTTPStatus.OK, {"ok": True, "command": command})
+                    return
+
+                server_ref._json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "message": "Not found."})
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b"{}"
+                try:
+                    payload = json.loads(body.decode("utf-8") or "{}")
+                except Exception:
+                    payload = {}
+                result = server_ref.handle_command_request(payload)
+                server_ref._json_response(self, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST, result)
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+                return
+
+        return PairingRequestHandler
+
+    def handle_command_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(payload.get("action", "")).strip().lower()
+        target = str(payload.get("target", "")).strip()
+        value = str(payload.get("value", "")).strip()
+        metadata = payload.get("metadata") or {}
+
+        if not self.validate(os.environ.get("BUDDY_MOBILE_PAIR_CODE", ""), os.environ.get("BUDDY_MOBILE_PAIR_TOKEN", "")):
+            if not _is_connected():
+                return {"ok": False, "message": "Pairing required before sending commands."}
+
+        if not action:
+            return {"ok": False, "message": "No action supplied."}
+
+        controller = MobileController()
+        if action == "complete_pairing":
+            code = str(payload.get("pair_code", "")).strip()
+            token = str(payload.get("pair_token", "")).strip()
+            return controller.complete_pairing(code, token)
+
+        command_result = controller.execute(action, target=target, value=value, metadata=metadata)
+        return {
+            "ok": True,
+            "message": command_result,
+            "action": action,
+            "target": target,
+            "value": value,
+        }
+
+    def start(self) -> None:
+        if self.is_running():
+            return
+
+        self._stop_event.clear()
+
+        def _serve() -> None:
+            try:
+                self._httpd = ThreadingHTTPServer((self.host, self.port), self._make_handler())
+            except OSError:
+                # Something (very likely an earlier instance of this same
+                # server) already owns the port. That earlier instance is
+                # presumably still serving fine, so there's nothing to do.
+                return
+            self._httpd.timeout = 0.5
+            try:
+                while not self._stop_event.is_set():
+                    self._httpd.handle_request()
+            finally:
+                if self._httpd is not None:
+                    self._httpd.server_close()
+                    self._httpd = None
+
+        self._thread = threading.Thread(target=_serve, daemon=True)
+        self._thread.start()
+        # Give the background thread a moment to actually bind the socket
+        # before callers ask is_running()/build a QR code around it.
+        time.sleep(0.05)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1)
+
+    def build_response(self, code: str, token: str) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "local_only": True,
+            "one_time": True,
+            "pair_code": code,
+            "token": token,
+            "message": "Pairing accepted on localhost.",
+        }
+
+    def validate(self, code: str, token: str) -> bool:
+        env_code = os.environ.get("BUDDY_MOBILE_PAIR_CODE", "")
+        env_token = os.environ.get("BUDDY_MOBILE_PAIR_TOKEN", "")
+        env_expiry = int(os.environ.get("BUDDY_MOBILE_PAIR_EXPIRY", "0"))
+        now = int(time.time())
+        if not env_code or not env_token or now >= env_expiry:
+            return False
+        return code == env_code and token == env_token
+
+
+def _ensure_server_running(host: str, port: int = 8765) -> LocalPairingServer:
+    """Start the one shared pairing server if it isn't already running.
+
+    Uses the sys-backed shared state so repeated calls (e.g. the HUD polling
+    every few seconds) reuse the same running server instead of each trying
+    to bind a brand new one to the same port.
+    """
+    state = _shared_state()
+    with state["server_lock"]:
+        server: Optional[LocalPairingServer] = state["server"]
+        if server is None or not server.is_running():
+            server = LocalPairingServer(host=host, port=port)
+            server.start()
+            state["server"] = server
+        return server
+
+
+class MobileController:
+    """Controller for basic phone operations through a paired device bridge."""
+
+    def __init__(self) -> None:
+        self.platform_name = platform.system()
+
+    def get_local_ip(self) -> str:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                return sock.getsockname()[0]
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return "127.0.0.1"
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        connected = _is_connected()
+        return {
+            "connected": connected,
+            "status": "CONNECTED" if connected else "DISCONNECTED",
+            "label": "Mobile connected" if connected else "Mobile disconnected",
+        }
+
+    def get_pairing_info(self) -> Dict[str, Any]:
+        code = os.environ.get("BUDDY_MOBILE_PAIR_CODE")
+        if not code:
+            code = f"{random.randint(1000, 9999)}"
+            os.environ["BUDDY_MOBILE_PAIR_CODE"] = code
+        host = self.get_local_ip()
+        _ensure_server_running(host)
+        expiry = int(time.time()) + 600
+        token = hashlib.sha256(f"{code}:{expiry}".encode("utf-8")).hexdigest()[:24]
+        challenge = base64.urlsafe_b64encode(os.urandom(12)).decode("ascii").rstrip("=")
+        secret = base64.urlsafe_b64encode(os.urandom(16)).decode("ascii").rstrip("=")
+        os.environ["BUDDY_MOBILE_PAIR_TOKEN"] = token
+        os.environ["BUDDY_MOBILE_PAIR_EXPIRY"] = str(expiry)
+        os.environ["BUDDY_MOBILE_PAIR_CHALLENGE"] = challenge
+        os.environ["BUDDY_MOBILE_PAIR_SECRET"] = secret
+        return {
+            "pair_code": code,
+            "host": host,
+            "port": 8765,
+            # NOTE: this now points at /pair (the endpoint that actually
+            # validates the code and marks the phone connected) instead of
+            # /connect (which was only ever a no-op health check).
+            "connect_url": f"http://{host}:8765/pair?code={code}",
+            "instructions": "On the same Wi-Fi: open the Buddy Mobile app, enter this IP and code, and tap Pair.",
+            "local_only": True,
+            "one_time": True,
+            "expires_at": expiry,
+            "challenge": challenge,
+            "secret_hint": "A random secret was generated for the handshake.",
+        }
+
+    def build_command(self, action: str, target: str = "", value: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Builds the URI/payload a *phone* should act on for a given action.
+
+        Kept as reference for what the mobile app's own action handling
+        should mirror. No longer called from execute() below, since running
+        these locally on the PC (the old behaviour) never actually reached
+        the phone - see execute()'s docstring.
+        """
+        metadata = metadata or {}
+        action = (action or "").strip().lower()
+        target = (target or "").strip()
+        value = (value or "").strip()
+
+        if action == "call":
+            return f"tel:{urllib.parse.quote(target)}"
+
+        if action == "sms":
+            return f"smsto:{urllib.parse.quote(target)}?body={urllib.parse.quote(value)}"
+
+        if action == "open_app":
+            app_map = {
+                "whatsapp": "com.whatsapp",
+                "telegram": "org.telegram.messenger",
+                "youtube": "com.google.android.youtube",
+                "youtube music": "com.google.android.apps.youtube.music",
+                "spotify": "com.spotify.music",
+                "google keep": "com.google.android.keep",
+                "contacts": "com.android.contacts",
+                "chrome": "com.android.chrome",
+            }
+            package = app_map.get(target.lower(), target)
+            return f"android-app://{package}" if package else ""
+
+        if action == "play_media":
+            service_urls = {
+                "youtube": "https://www.youtube.com/results?search_query=",
+                "youtubemusic": "https://music.youtube.com/search?q=",
+                "spotify": "https://open.spotify.com/search/",
+            }
+            base = service_urls.get(target.lower(), "https://www.youtube.com/results?search_query=")
+            query = urllib.parse.quote(value or target)
+            return f"{base}{query}"
+
+        if action == "make_note":
+            note_text = urllib.parse.quote(value or "New note")
+            return f"android-app://com.google.android.keep?note={note_text}"
+
+        if action == "send_message":
+            platform_name = (metadata.get("platform") or "whatsapp").strip().lower()
+            payload = {
+                "platform": platform_name,
+                "target": target,
+                "message": value,
+            }
+            return json.dumps(payload)
+
+        return ""
+
+    def execute(self, action: str, target: str = "", value: str = "", metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Queues an action for the paired phone to pick up and run.
+
+        The previous version of this method ran `build_command()`'s output
+        through `cmd /c start` *on the PC*. That never reached the phone -
+        Windows has no handler for schemes like `android-app://...`, and
+        even `tel:`/`smsto:` only do something if some PC app happens to be
+        registered for them. Real phone control needs the phone itself to
+        act on the command, so this now drops it in the shared queue that
+        the paired phone polls via GET /commands/next.
+        """
+        metadata = metadata or {}
+        if not _is_connected():
+            _enqueue_command(action, target, value, metadata)
+            return "No phone is paired right now - I queued it for as soon as one connects."
+        _enqueue_command(action, target, value, metadata)
+        return f"Sent to your phone: {action} {(target or value)}".strip()
+
+    def complete_pairing(self, code: str, token: str) -> Dict[str, Any]:
+        validator = LocalPairingServer()
+        if not validator.validate(code, token):
+            return {"ok": False, "message": "Pairing failed or expired."}
+        os.environ["BUDDY_MOBILE_CONNECTED"] = "1"
+        os.environ.pop("BUDDY_MOBILE_PAIR_TOKEN", None)
+        os.environ.pop("BUDDY_MOBILE_PAIR_EXPIRY", None)
+        _ensure_server_running(self.get_local_ip())
+        return validator.build_response(code, token)
+
+    def start_local_server(self, host: Optional[str] = None) -> Dict[str, Any]:
+        server = _ensure_server_running(host or self.get_local_ip())
+        return {
+            "ok": True,
+            "host": server.host,
+            "port": server.port,
+            "message": "Local companion server started.",
+        }
+
+    def get_companion_page(self) -> str:
+        base_dir = Path(__file__).resolve().parent
+        page_path = base_dir / "companion.html"
+        if not page_path.exists():
+            return ""
+        return page_path.read_text(encoding="utf-8")
+
+    def get_qr_payload(self) -> Dict[str, Any]:
+        info = self.get_pairing_info()
+        url = info.get("connect_url", "")
+        if not url:
+            return {"ok": False, "message": "No pairing URL available."}
+        if qrcode is None:
+            return {"ok": False, "message": "qrcode package is not installed."}
+        img = qrcode.make(url)
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return {
+            "ok": True,
+            "url": url,
+            "image_base64": encoded,
+            "mime": "image/png",
+        }
+
+    def wrap_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        secret = os.environ.get("BUDDY_MOBILE_PAIR_SECRET", "")
+        if not secret:
+            return {"ok": False, "message": "No active mobile secret."}
+        payload = json.dumps(command, sort_keys=True).encode("utf-8")
+        token = hashlib.sha256(payload + secret.encode("utf-8")).hexdigest()
+        return {
+            "ok": True,
+            "payload": base64.urlsafe_b64encode(payload).decode("ascii"),
+            "token": token,
+        }
+
+
+def mobile_controller(parameters=None, response=None, player=None, session_memory=None) -> str:
+    params = parameters or {}
+    action = str(params.get("action", "")).strip().lower()
+    target = str(params.get("target", "")).strip()
+    value = str(params.get("value", "")).strip()
+    metadata = params.get("metadata") or {}
+    controller = MobileController()
+
+    if not action:
+        return "Please specify a mobile action, sir."
+
+    if action == "complete_pairing":
+        code = str(params.get("pair_code", "")).strip()
+        token = str(params.get("pair_token", "")).strip()
+        result = controller.complete_pairing(code, token)
+        return json.dumps(result)
+
+    if action == "start_local_server":
+        result = controller.start_local_server()
+        return json.dumps(result)
+
+    if action == "get_companion_page":
+        return controller.get_companion_page()
+
+    if action == "get_qr_payload":
+        return json.dumps(controller.get_qr_payload())
+
+    try:
+        return controller.execute(action, target=target, value=value, metadata=metadata)
+    except Exception as exc:
+        return f"Mobile control failed: {exc}"

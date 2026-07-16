@@ -1,0 +1,47 @@
+const PORT = 8765;
+
+export async function testConnection(ip: string) {
+  try {
+    const response = await fetch(`http://${ip}:${PORT}/connect`);
+
+    if (!response.ok) {
+      return {
+        success: false,
+        message: "Server responded with an error.",
+      };
+    }
+
+    const data = await response.json();
+
+    return {
+      success: true,
+      data,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: "Cannot connect to Buddy PC.",
+    };
+  }
+}
+
+export async function pairWithPC(
+  ip: string,
+  code: string,
+  token: string = ""
+) {
+  try {
+    const response = await fetch(
+      `http://${ip}:${PORT}/pair?code=${encodeURIComponent(code)}&token=${encodeURIComponent(token)}`
+    );
+
+    const data = await response.json();
+
+    return data;
+  } catch (error) {
+    return {
+      ok: false,
+      message: "Pairing failed.",
+    };
+  }
+}

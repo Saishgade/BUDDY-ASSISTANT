@@ -1,0 +1,17 @@
+{
+  "name": "buddy-root",
+  "private": true,
+  "scripts": {
+    "start:buddy-mobile": "cd \"buddy-mobile\" && npm run start",
+    "start:BuddyMobile": "cd \"BuddyMobile\" && npm run start",
+    "start:mobile_app": "cd \"mobile_app\" && npm run start",
+    "start": "npm run start:buddy-mobile"
+  },
+  "dependencies": {
+    "expo": "^57.0.6"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.4",
+    "typescript": "~6.0.3"
+  }
+}

@@ -98,30 +98,6 @@ def _load_mobile_controller():
     return getattr(module, "mobile_controller", None) or (lambda *args, **kwargs: "Mobile controller is unavailable.")
 
 
-def _load_mobile_status_provider():
-    """Loads a fresh MobileController() instance for the HUD to query.
-
-    _load_mobile_controller() above returns the `mobile_controller`
-    dispatcher *functidef _load_mobile_controller():
-    on* (used for actual tool calls), which has no
-    get_connection_status()/get_pairing_info() methods of its own. The HUD
-    needs an actual MobileController instance, so this loads the module
-    separately and instantiates the class directly.
-    """
-    mobile_controller_path = BASE_DIR / "mobile controller" / "controller.py"
-    spec = importlib.util.spec_from_file_location("mobile_controller_status", mobile_controller_path)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-        controller_cls = getattr(module, "MobileController", None)
-        return controller_cls() if controller_cls else None
-    except Exception as exc:
-        print(f"[BUDDY] ⚠️ Failed to load mobile controller status provider: {exc}")
-        return None
-
-
 mobile_controller = _load_mobile_controller()
 CONFIG_DIR      = BASE_DIR / "config"
 API_CONFIG_PATH = CONFIG_DIR / "api_keys.json"
@@ -1601,11 +1577,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_mobile_status(self):
         try:
-            provider = _load_mobile_status_provider()
-            if provider is None:
-                raise RuntimeError("mobile controller status provider unavailable")
-            status = provider.get_connection_status()
-            pairing = provider.get_pairing_info()
+            controller = _load_mobile_controller()
+            status = controller.get_connection_status()
+            pairing = controller.get_pairing_info()
         except Exception:
             status = {"connected": False, "status": "DISCONNECTED", "label": "Mobile disconnected"}
             pairing = {"pair_code": "0000", "connect_url": "", "instructions": ""}
@@ -2158,7 +2132,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "mobile_controller",
-        "description": "Controls a paired phone for calls, app opening, WhatsApp/Telegram/SMS messaging, media playback, and notes. Accepts explicit actions or natural-language requests such as 'Open WhatsApp on my phone' or 'Call Dad'.",
+        "description": "Controls a paired phone for calls, app opening, WhatsApp/Telegram/SMS messaging, media playback, and notes via a private local pairing flow.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -2167,10 +2141,9 @@ TOOL_DECLARATIONS = [
                 "value": {"type": "STRING", "description": "Message text, note content, or search query"},
                 "metadata": {"type": "OBJECT", "description": "Optional platform details such as platform: whatsapp or telegram"},
                 "pair_code": {"type": "STRING", "description": "One-time pairing code entered on the phone"},
-                "pair_token": {"type": "STRING", "description": "Short-lived local pairing token issued by Buddy"},
-                "text": {"type": "STRING", "description": "Natural-language phone request such as 'Open WhatsApp on my phone', 'Call Dad', or 'Create a note'"}
+                "pair_token": {"type": "STRING", "description": "Short-lived local pairing token issued by Buddy"}
             },
-            "required": []
+            "required": ["action"]
         }
     },
     {

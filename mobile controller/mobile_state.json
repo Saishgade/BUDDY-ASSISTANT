@@ -1,0 +1,15 @@
+{
+  "connected": false,
+  "pair_code": "1800",
+  "pair_token": "261ba5ea8daa4af0e8b95b29",
+  "queue": [
+    {
+      "id": "wiEhUFYi",
+      "action": "open_app",
+      "target": "whatsapp",
+      "value": "",
+      "metadata": {},
+      "created_at": 1783190597.1100593
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Buddy Mobile Companion</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #07111b; color: #e6f2ff; margin: 0; padding: 24px; }
+    .card { max-width: 520px; margin: 0 auto; background: #0f1d2b; border: 1px solid #2b4460; border-radius: 14px; padding: 20px; }
+    .pill { display: inline-block; padding: 6px 10px; border-radius: 999px; background: #1c4f6b; color: #b8f5ff; font-size: 12px; margin-bottom: 12px; }
+    input { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 8px; border-radius: 8px; border: 1px solid #35617f; background: #101f2f; color: white; }
+    button { margin-top: 12px; width: 100%; padding: 10px; border: none; border-radius: 8px; background: #2fa4d8; color: white; font-weight: bold; }
+    .hint { color: #92b9cd; font-size: 13px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="pill">Local-only companion</div>
+    <h2>Buddy Mobile Companion</h2>
+    <p>Open this page on your phone to pair with your PC securely over localhost.</p>
+    <label for="code">Enter the pairing code shown on your PC</label>
+    <input id="code" placeholder="1234" />
+    <button onclick="submitPairing()">Pair Now</button>
+    <div class="hint" id="status">No pairing started yet.</div>
+  </div>
+  <script>
+    async function submitPairing() {
+      const code = document.getElementById('code').value.trim();
+      const status = document.getElementById('status');
+      if (!code) { status.textContent = 'Please enter the code from Buddy.'; return; }
+      status.textContent = 'Connecting...';
+      try {
+        const response = await fetch('/pair?code=' + encodeURIComponent(code));
+        const data = await response.json();
+        status.textContent = data.message || 'Pairing complete.';
+      } catch (err) {
+        status.textContent = 'Pairing failed: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>
